@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Generate a safe, machine-owned repository snapshot for context handoffs.
+
+This script reads Git metadata and path names only; it does not read source file contents,
+configuration values, environment files, or user records. It is intentionally dependency-free.
+"""
+from __future__ import annotations
+import argparse
+import hashlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+from datetime import datetime
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "context" / "AUTO_STATE.md"
+IGNORED_SNAPSHOT = "context/AUTO_STATE.md"
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".next", "dist", "build", "coverage", ".pytest_cache", ".mypy_cache"}
+SIGNALS = {
+    "JavaScript / Node": ["package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"],
+    "TypeScript": ["tsconfig.json"],
+    "Vite": ["vite.config.js", "vite.config.ts", "vite.config.mjs"],
+    "Next.js": ["next.config.js", "next.config.mjs", "next.config.ts"],
+    "Vue tooling": ["vue.config.js", "vite.config.ts"],
+    "Python": ["pyproject.toml", "requirements.txt", "Pipfile", "setup.py"],
+    "Go": ["go.mod"],
+    "Rust": ["Cargo.toml"],
+    "Java / Maven": ["pom.xml"],
+    "Java / Gradle": ["build.gradle", "build.gradle.kts"],
+    "Static HTML entry signal": ["index.html"],
+    "Docker": ["Dockerfile", "docker-compose.yml", "compose.yaml", "compose.yml"],
+}
+
+def run_git(*args: str) -> tuple[int, str]:
+    try:
+        p = subprocess.run(["git", *args], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           text=True, encoding="utf-8", errors="replace", timeout=10)
+        return p.returncode, p.stdout.rstrip("\n")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return 127, ""
+
+def git_text(*args: str) -> str:
+    code, value = run_git(*args)
+    return value if code == 0 else ""
+
+def safe_lines(s: str) -> list[str]:
+    return [x.strip() for x in s.splitlines() if x.strip()]
+
+def normalize_status_path(line: str) -> str:
+    p = line[3:].strip()
+    if " -> " in p:
+        p = p.rsplit(" -> ", 1)[-1]
+    return p.replace('"', "").replace("\\", "/")
+
+def root_entries() -> list[str]:
+    result = []
+    try:
+        children = sorted(ROOT.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError:
+        return ["(unable to list repository root)"]
+    for p in children:
+        if p.name in SKIP_DIRS:
+            continue
+        if p.name in {".DS_Store", "Thumbs.db"}:
+            continue
+        result.append(f"{p.name}/" if p.is_dir() else p.name)
+    return result[:120]
+
+def detect_signals() -> list[str]:
+    hits = []
+    for label, names in SIGNALS.items():
+        matched = [n for n in names if (ROOT / n).exists()]
+        if matched:
+            hits.append(f"- {label}: {', '.join(matched)}")
+    if not hits:
+        hits.append("- No common root-level manifest/configuration signal detected; inspect the repository directly.")
+    return hits
+
+def repository_file_metadata() -> list[str]:
+    """Metadata-only fallback for non-Git folders; never opens file contents."""
+    rows = []
+    count = 0
+    for current, dirs, names in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in names:
+            path = Path(current) / name
+            rel = path.relative_to(ROOT).as_posix()
+            if rel == IGNORED_SNAPSHOT:
+                continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            count += 1
+            rows.append((st.st_mtime, rel, st.st_size))
+    rows.sort(reverse=True)
+    top = [f"- `{rel}` — {size} bytes; mtime {datetime.fromtimestamp(mtime).astimezone().isoformat(timespec='seconds')}"
+           for mtime, rel, size in rows[:20]]
+    return [f"File count (best-effort; ignored/cache directories excluded): {count}", *top]
+
+def status_path_metadata(status_lines: list[str]) -> list[str]:
+    """Capture filesystem metadata for paths reported by Git without reading file contents."""
+    result = []
+    for line in status_lines:
+        rel = normalize_status_path(line)
+        if not rel or rel == IGNORED_SNAPSHOT:
+            continue
+        path = ROOT / rel
+        try:
+            st = path.lstat()
+            result.append(f"{rel}|size={st.st_size}|mtime_ns={st.st_mtime_ns}|mode={st.st_mode}")
+        except OSError:
+            result.append(f"{rel}|missing-or-unstatable")
+    return result
+
+def collect() -> tuple[str, str]:
+    is_git = git_text("rev-parse", "--is-inside-work-tree") == "true"
+    generated = datetime.now().astimezone().isoformat(timespec="seconds")
+    entries = root_entries()
+    signals = detect_signals()
+    lines: list[str] = []
+    lines.append("# Automatically Generated Repository Snapshot")
+    lines.append("")
+    lines.append("> Machine-generated by `scripts/context_sync.py`. Do not edit manually. This snapshot is navigation/change evidence only; it is not proof of feature behavior, security, test success or deployment.")
+    lines.append("")
+    lines.append(f"- Generated at: `{generated}`")
+    lines.append(f"- Repository root name: `{ROOT.name}`")
+    lines.append(f"- Git repository detected: **{'yes' if is_git else 'no'}**")
+
+    fingerprint_parts = [str(is_git), *entries, *signals]
+    if is_git:
+        branch = git_text("rev-parse", "--abbrev-ref", "HEAD") or "unknown"
+        head = git_text("rev-parse", "--short", "HEAD") or "no commit detected"
+        last = safe_lines(git_text("log", "-1", "--date=short", "--pretty=format:%h | %ad | %s"))
+        status_lines = safe_lines(git_text("status", "--porcelain=v1", "--untracked-files=all"))
+        status_lines = [line for line in status_lines if normalize_status_path(line) != IGNORED_SNAPSHOT]
+        recent = safe_lines(git_text("log", "-8", "--date=short", "--pretty=format:%h | %ad | %s"))
+        staged = safe_lines(git_text("diff", "--cached", "--name-status"))
+        unstaged = safe_lines(git_text("diff", "--name-status"))
+        status_meta = status_path_metadata(status_lines)
+        lines.extend([f"- Branch: `{branch}`", f"- HEAD commit: `{head}`"])
+        lines.append(f"- Most recent commit: {last[0] if last else 'No commit metadata available.'}")
+        lines.append("")
+        lines.append("## Working-tree changes")
+        lines.append("")
+        if status_lines:
+            lines.extend(f"- `{line}`" for line in status_lines[:250])
+            if len(status_lines) > 250:
+                lines.append(f"- ... and {len(status_lines) - 250} additional status entries (truncated).")
+        else:
+            lines.append("- No Git working-tree changes detected (excluding this generated snapshot).")
+        lines.append("")
+        lines.append("### Staged path summary")
+        lines.append("")
+        lines.extend(f"- `{x}`" for x in staged[:100]) if staged else lines.append("- None detected.")
+        lines.append("")
+        lines.append("### Unstaged tracked path summary")
+        lines.append("")
+        lines.extend(f"- `{x}`" for x in unstaged[:100]) if unstaged else lines.append("- None detected.")
+        lines.append("")
+        lines.append("## Recent commits")
+        lines.append("")
+        lines.extend(f"- {x}" for x in recent) if recent else lines.append("- No commit history available.")
+        fingerprint_parts.extend([branch, head, *status_lines, *status_meta, *staged, *unstaged, *recent])
+    else:
+        lines.append("- Warning: Git metadata is unavailable. This mode records file metadata only and may not detect every ignored or content-only change reliably.")
+        lines.append("")
+        lines.append("## Recent file metadata (no file contents read)")
+        lines.append("")
+        meta = repository_file_metadata()
+        lines.extend(meta)
+        fingerprint_parts.extend(meta)
+
+    lines.append("")
+    lines.append("## Root entries")
+    lines.append("")
+    lines.extend(f"- `{x}`" for x in entries) if entries else lines.append("- No entries found.")
+    lines.append("")
+    lines.append("## Detected project signals (not a stack verdict)")
+    lines.append("")
+    lines.extend(signals)
+    lines.append("")
+    lines.append("## Interpretation guardrails")
+    lines.append("")
+    lines.append("- Manifests and filenames are discovery signals, not proof of the runtime architecture or feature status.")
+    lines.append("- This script intentionally does not read source/configuration contents. Inspect those files directly for a real audit.")
+    lines.append("- Working-tree paths plus changed-path filesystem metadata help detect stale snapshots; file contents are not included in this report.")
+    lines.append("- The sync script is run-driven, not an always-on file watcher; the agent must run it at session start and before handoff.")
+    digest = hashlib.sha256("\n".join(fingerprint_parts).encode("utf-8", "replace")).hexdigest()[:16]
+    lines.append("")
+    lines.append(f"<!-- context-sync-fingerprint: {digest} -->")
+    lines.append("")
+    return "\n".join(lines), digest
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="check whether the saved snapshot matches current repository metadata, without writing")
+    mode.add_argument("--stdout", action="store_true", help="print the generated snapshot without writing it")
+    args = parser.parse_args()
+    content, fingerprint = collect()
+    if args.stdout:
+        print(content, end="")
+        return 0
+    if args.check:
+        try:
+            old = OUT.read_text(encoding="utf-8")
+        except OSError:
+            print("STALE: snapshot is missing. Run `python scripts/context_sync.py`.", file=sys.stderr)
+            return 1
+        marker = "<!-- context-sync-fingerprint: "
+        found = None
+        for line in old.splitlines():
+            if marker in line:
+                found = line.split(marker, 1)[1].split("-->", 1)[0].strip()
+                break
+        if found == fingerprint:
+            print(f"FRESH: repository fingerprint {fingerprint}")
+            return 0
+        print(f"STALE: saved fingerprint {found or '(missing)'}; current fingerprint {fingerprint}. Run `python scripts/context_sync.py`.", file=sys.stderr)
+        return 1
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(content, encoding="utf-8")
+    print(f"Updated {OUT.relative_to(ROOT).as_posix()} (fingerprint {fingerprint}).")
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

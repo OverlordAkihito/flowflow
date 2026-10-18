@@ -1,0 +1,10 @@
+# Work State
+
+**Milestone:** Home has been upgraded in source from the Compose-only orbit into a native OpenGL ES 2.0 music universe. A follow-up UI polish pass now applies a shared cosmic palette, rounded shape tokens, translucent gradient-edged panels, a layered static nebula/star backdrop, clearer selected/focused states, and adaptive content widths throughout the Compose screens.
+
+**Interaction and resilience:** Single-finger drag rotates; pinch and pointer-wheel change camera distance; two-finger movement pans; zoom buttons and double-tap recenter the Earth. Camera motion eases to targets, zoom/pan are bounded, current playback is highlighted, and system animation scale disables continuous scene motion. A selected/recent track anchors a window of up to 24 visible satellites; Next/Previous and library selection bring other tracks into that window. A Compose orbit view remains as the fallback when ES2 or shader setup fails. Album art and label atlas generation runs on a worker thread.
+
+**Checks:** The user previously reported a Kotlin `customActions` unresolved reference; that unsupported semantics assignment was removed, preserving the scene description and existing playback controls. For the current UI polish, `:app:compileDebugKotlin`, `:app:lintDebug`, and `:app:testDebugUnitTest` were attempted using Gradle 8.13/JDK 17 with the existing user Gradle cache. Gradle failed before project configuration with `java.io.IOException: Unable to establish loopback connection`; no source compilation, lint, tests, or APK build completed in this environment. Device/emulator rendering, responsive layouts, interaction states, playback, accessibility, and performance are NOT VERIFIED.
+
+**Next action:** On the user's PC in VS Code, rerun `& "$PWD\gradlew.bat" :app:installDebug` to compile/install the latest UI and renderer changes; capture any compiler output. If successful, verify screens on a phone and tablet/emulator, keyboard/TalkBack focus, reduced motion, playback controls, and orbit interactions. The debug APK appears at `app\build\outputs\apk\debug\app-debug.apk` after a successful build.
+
